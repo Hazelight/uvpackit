@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package version="1500">
+  <kit name="uvpackit" restart="YES">
+    <source target="uvpackit/index.cfg">index.cfg</source>
+    <source target="uvpackit/icons/uvp_20.png">icons/uvp_20.png</source>
+    <source target="uvpackit/icons/uvp_32.png">icons/uvp_32.png</source>
+    <source target="uvpackit/win64/uvpcore.dll">win64/uvpcore.dll</source>
+    <source target="uvpackit/win64/uvpackit.dll">win64/uvpackit.dll</source>
+  </kit>
+  <message button="Help">Successfully installed uvpackit.</message>
+</package>
