@@ -144,11 +144,13 @@ public:
 			// WARNING: this operation is time consuming (in particular it iterates over all UV data),
 			// that is why it should only be executed when debugging the application. It should
 			// never be used in production.
+			// https://uvpackmaster.com/sdkdoc/40-uv-map-format/
 			const char* pValidationResult = uvpInput.validate();
 
+			// This runtime error will be caught inside the ccommand::execute when getting result from future,
 			if (pValidationResult)
 			{
-				throw std::runtime_error("Operation input validation failed: " + std::string(pValidationResult));
+				throw std::runtime_error("UVP Operation input validation failed: " + std::string(pValidationResult));
 			}
 		}
 
@@ -275,7 +277,13 @@ public:
 	std::vector<UvVertT> m_VertArray;
 	std::vector<UvFaceT> m_FaceArray;
 
-	CVisitor(CLxUser_Polygon* polygon, CLxUser_Point* point, LXtMeshMapID meshmapID) : polygon(polygon), point(point), meshmapID(meshmapID) {}
+	CLxUser_MeshService mesh_service;
+	unsigned mode;
+
+	CVisitor(CLxUser_Polygon* polygon, CLxUser_Point* point, LXtMeshMapID meshmapID) : polygon(polygon), point(point), meshmapID(meshmapID) 
+	{
+		check(mesh_service.ModeCompose("select", NULL, &mode));
+	}
 
 	// For each polygon, call this function,
 	LxResult Evaluate() LXx_OVERRIDE
@@ -283,6 +291,8 @@ public:
 		unsigned vertexIndex = 0;
 		unsigned vertexCount = 0;
 		check(polygon->VertexCount(&vertexCount));
+		
+		LxResult IsSelected = polygon->TestMarks(mode);
 
 		LXtFVector2 texcoord;
 		LXtPointID pointID;
@@ -295,6 +305,8 @@ public:
 
 		this->m_FaceArray.emplace_back(index);
 		UvFaceT& face = this->m_FaceArray.back();
+		if (IsSelected == LXe_TRUE)
+			face.m_InputFlags = 1;
 
 		auto &faceVerts = face.m_Verts;
 		faceVerts.reserve((int)vertexCount);
@@ -363,6 +375,8 @@ public:
 	void basic_Execute(unsigned flags);
 
 	void cmd_error(LxResult rc, const char* message);
+
+	bool selectedPolygons();
 };
 
 // Initialize the command, creating the arguments
@@ -376,6 +390,11 @@ CCommand::CCommand()
 	dyna_Add("pixelMargin", LXsTYPE_FLOAT);
 	dyna_Add("pixelPadding", LXsTYPE_FLOAT);
 	dyna_Add("pixelMarginTextureSize", LXsTYPE_INTEGER);
+
+	dyna_Add("normalizeIslands", LXsTYPE_BOOLEAN);
+
+	dyna_Add("renderInvalid", LXsTYPE_BOOLEAN);
+	dyna_SetFlags(7, LXfCMDARG_OPTIONAL);
 }
 
 // Set default values for the command dialog
@@ -398,6 +417,27 @@ int CCommand::basic_CmdFlags()
 	return LXfCMD_MODEL | LXfCMD_UNDO;
 }
 
+// Utility method for checking if we have any currently selected polygons
+bool CCommand::selectedPolygons()
+{
+	bool result = false;
+
+	// Initiate the selection service and an array with polygon type and a null,
+	CLxUser_SelectionService selection_service;
+	LXtID4 selection_types[2];
+	
+	selection_types[0] = selection_service.LookupType(LXsSELTYP_POLYGON);
+	selection_types[1] = 0;
+
+	// Check the service for currently active selection type,
+	LXtID4 current_type = selection_service.CurrentType(selection_types);
+
+	// If we are in polygon mode and have polygons selected, result should be set to true
+	if (current_type == LXiSEL_POLYGON)
+		result = selection_service.Count(LXiSEL_POLYGON);
+
+	return result;
+}
 
 // Make sure the command is disabled with no active layers
 bool CCommand::basic_Enable(CLxUser_Message& msg)
@@ -477,7 +517,31 @@ void CCommand::basic_Execute(unsigned flags)
 	// If set to true, the packer will automatically scale UV islands 
 	// before packing so that the average texel density is the same 
 	// for every island.
-	uvpInput.m_NormalizeIslands = true;
+	uvpInput.m_NormalizeIslands = dyna_Bool(6, false);
+
+	// If users are in Polygon mode, and have polygons selected, assume they want to pack
+	// the selected polygons into pre-existing packing solution.
+	bool bArePolygonsSelected = selectedPolygons();
+	uvpInput.m_PackToOthers = bArePolygonsSelected;
+
+	// If m_ProcessedUnselected is set to false (the default state), then the 
+	// SELECTED flag of the UV faces is ignored by the packer and every island
+	// is considered as selected (the application doesn’t have to set this flag
+	// in such a case).
+	uvpInput.m_ProcessUnselected = bArePolygonsSelected; // Required so we check unselected
+
+	// Optionally, render invalid UVs to better show users how to satisfy the packer.
+	if(dyna_IsSet(7))
+		uvpInput.m_RenderInvalidIslands = dyna_Bool(7, false);
+
+	// Set debug to false for release,
+	#ifdef _DEBUG
+	bool debugMode = true;
+	#else
+	bool debugMode = false;
+	#endif
+
+	UvpOpExecutorT opExecutor(debugMode);
 
 	CLxUser_StdDialogService dialog_service;
 	CLxUser_LayerService layer_service;
@@ -537,15 +601,6 @@ void CCommand::basic_Execute(unsigned flags)
 		dialog_service.MonitorAllocate("Packing", monitor);
 		monitor.Init(100);
 
-		// Set debug to false for release,
-		#ifdef _DEBUG
-		bool debugMode = true;
-		#else
-		bool debugMode = false;
-		#endif
-
-		UvpOpExecutorT opExecutor(debugMode);
-
 		// Run the execute method in another thread to not block main thread,
 		// see execute method for more details...
 		auto future = std::async(std::bind(&UvpOpExecutorT::execute, &opExecutor, uvpInput));
@@ -578,7 +633,28 @@ void CCommand::basic_Execute(unsigned flags)
 
 		// Get the result code from the packer instance, hopefully joins
 		// the async thread also.
-		UVP_ERRORCODE Result = future.get();
+		UVP_ERRORCODE Result = UVP_ERRORCODE::GENERAL_ERROR;
+		try
+		{
+			if (future.valid())
+			{
+				Result = future.get();
+			}
+		} // Should only raise an exception if we're running in debug
+		catch (const std::exception& ex) {
+			// Set up to create log entries,
+			CLxUser_Log log;
+			CLxUser_LogService log_service;
+			CLxUser_LogEntry entry;
+
+			// Get the Master Log,
+			log_service.GetSubSystem(LXsLOG_LOGSYS, log);
+
+			// Print the runtime error to log so we can read any validation errors.
+			log_service.NewEntry(LXe_INFO, ex.what(), entry);
+
+			log.AddEntry(entry);
+		}
 
 		// Release progress bar.
 		dialog_service.MonitorRelease();
@@ -592,10 +668,16 @@ void CCommand::basic_Execute(unsigned flags)
 		case UVP_ERRORCODE::CANCELLED:
 			cmd_error(LXe_ABORT, "uvpAborted");
 			break;
+		case UVP_ERRORCODE::INVALID_ISLANDS:
+			cmd_error(LXe_FAILED, "uvpInvalidIslands");
+			break;
 		case UVP_ERRORCODE::NO_SPACE:
 			// We have likely restricted the packer from scaling the 
 			// islands, and it failed to fit them inside 0->1 uv range.
 			cmd_error(LXe_FAILED, "uvpNoSpace");
+			break;
+		case UVP_ERRORCODE::NO_VALID_STATIC_ISLAND:
+			cmd_error(LXe_FAILED, "uvpNoValidStaticIsland");
 			break;
 		default:
 			// Default to our "generic" error
@@ -647,7 +729,6 @@ void CCommand::basic_Execute(unsigned flags)
 				}
 			}
 		}
-
 		// This is where we then want to start setting the UV values ...
 		for (const UvFaceT& uvFace : visitor.m_FaceArray)
 		{
