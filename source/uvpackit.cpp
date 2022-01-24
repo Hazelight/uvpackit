@@ -260,109 +260,6 @@ void islandSolutionToMatrix(const UvpIslandPackSolutionT& islandSolution, CLxMat
 
 #define SRVNAME_COMMAND	"uvp.pack" // Define for our command name,
 
-// Polygon Visitor to iterate over each face, can be replaced by simple iterating
-// learned that the visitors are only better used when you only want to iterate selected etc...
-class CVisitor : public CLxImpl_AbstractVisitor
-{
-public:
-	// Accessors and the meshmap id we want to get uv values from
-	CLxUser_Polygon* polygon;
-	CLxUser_Point* point;
-	LXtMeshMapID meshmapID;
-
-	// Using a map only to check we don't add duplicate uv coords
-	std::unordered_map<UvVertT, int, UvVertHashT, UvVertEqualT> vertPointerMap;
-
-	// Containers to transfer the data to the uv packer later.
-	std::vector<UvVertT> m_VertArray;
-	std::vector<UvFaceT> m_FaceArray;
-
-	CLxUser_MeshService mesh_service;
-	unsigned mode;
-
-	CVisitor(CLxUser_Polygon* polygon, CLxUser_Point* point, LXtMeshMapID meshmapID) : polygon(polygon), point(point), meshmapID(meshmapID) 
-	{
-		check(mesh_service.ModeCompose("select", NULL, &mode));
-	}
-
-	// For each polygon, call this function,
-	LxResult Evaluate() LXx_OVERRIDE
-	{
-		unsigned vertexIndex = 0;
-		unsigned vertexCount = 0;
-		check(polygon->VertexCount(&vertexCount));
-		
-		LxResult IsSelected = polygon->TestMarks(mode);
-
-		LXtFVector2 texcoord;
-		LXtPointID pointID;
-
-		LXtFVector position;
-
-		// Store to the polygon index to face array
-		int index = 0;
-		check(polygon->Index(&index));
-
-		this->m_FaceArray.emplace_back(index);
-		UvFaceT& face = this->m_FaceArray.back();
-		if (IsSelected == LXe_TRUE)
-			face.m_InputFlags = 1;
-
-		auto &faceVerts = face.m_Verts;
-		faceVerts.reserve((int)vertexCount);
-		
-		for (int i = 0; i < vertexCount; i++)
-		{
-			// Get point in polygon,
-			polygon->VertexByIndex(i, &pointID);
-			point->Select(pointID);
-
-			UvVertT uv;
-
-			// Get the UV value for point in polygon
-			LxResult result;
-			result = polygon->MapEvaluate(meshmapID, pointID, texcoord);
-
-			// If the UV was not mapped, abort enumeration
-			if (result != LXe_OK)
-				return LXe_FAILED;
-
-			uv.m_UvCoords[0] = texcoord[0];
-			uv.m_UvCoords[1] = texcoord[1];
-
-			// Store the vertex index,
-			point->Index(&vertexIndex);
-			uv.m_ControlId = vertexIndex;
-
-			// Get the vertex position,
-			point->Pos(position);
-			uv.m_Vert3dCoords[0] = position[0];
-			uv.m_Vert3dCoords[1] = position[1];
-			uv.m_Vert3dCoords[2] = position[2];
-
-			// Push unique uvs to vectors,
-			auto it = this->vertPointerMap.find(uv);
-			size_t newVertIdx;
-			if (it == this->vertPointerMap.end())
-			{
-				// It is the first time we see such a vertex - add it to the array
-				newVertIdx = this->m_VertArray.size();
-				this->vertPointerMap[uv] = newVertIdx;
-				this->m_VertArray.emplace_back(uv);
-			}
-			else
-			{
-				// Such a vertex has already been added to the array.
-				newVertIdx = (*it).second;
-			}
-
-			faceVerts.pushBack(newVertIdx);
-		}
-
-		return LXe_OK;
-	}
-};
-
 class CCommand : public CLxBasicCommand
 {
 public:
@@ -551,200 +448,353 @@ void CCommand::basic_Execute(unsigned flags)
 	CLxUser_Mesh mesh;
 	CLxUser_Point point;
 	CLxUser_Polygon polygon;
-	CLxUser_MeshMap meshmap;
+	CLxUser_MeshMap vmap;
 
-	// Current layer index and total layer count
-	unsigned index, count;
+	LXtFVector2 texcoords;
+	LXtFVector position;
 
-	// Get all selected layers
-	check(layer_service.ScanAllocate(LXf_LAYERSCAN_EDIT, scan));
-	check(scan.Count(&count));
+	// vectors for the data,
+	std::unordered_map<UvVertT, int, UvVertHashT, UvVertEqualT> uv_map;  // Using a map only to check we don't add duplicate uv coords
 
-	// For each layer,
-	for (index = 0; index < count; index++)
+	// Containers to transfer the data to the uv packer later.
+	std::vector<UvVertT> m_VertArray;
+	std::vector<UvFaceT> m_FaceArray;
+
+	// UVP expects face id's as integer, while Modo have a typedef that can be cast to unsigned
+	// and I don't want to bother with converting
+	int uvp_face_index = 0;
+
+	// Lookup tables to match Modo's IDs with whatever we tell UVP
+	std::unordered_map<LXtPolygonID, int> polygon_map;
+	std::unordered_map<int, LXtPointID> point_map;
+
+	// Create the flag to test accessors for selection,
+	CLxUser_MeshService mesh_service;
+	unsigned mode;
+	check(mesh_service.ModeCompose("select", NULL, &mode));
+
+	// Iterate over all selected meshes,
+	CLxUser_LayerScan selected_layers;
+	unsigned selected_layers_count;
+	check(layer_service.ScanAllocate(LXf_LAYERSCAN_ACTIVE | LXf_LAYERSCAN_MARKPOLYS, selected_layers));
+	check(selected_layers.Count(&selected_layers_count));
+	for (unsigned layer_index = 0; layer_index < selected_layers_count; layer_index++)
 	{
-		// Get the editable mesh for current layer
-		check(scan.MeshEdit(index, mesh));
+		// Get mesh,
+		check(selected_layers.BaseMeshByIndex(layer_index, mesh));
 
-		// Get the Accessors for Point, Polygon and Meshmap
+		// Get accessors for point, poly and vmap
 		check(point.fromMesh(mesh));
 		check(polygon.fromMesh(mesh));
-		check(meshmap.fromMesh(mesh));
+		check(vmap.fromMesh(mesh));
 
-		// Get the default UV Map
-		check(meshmap.SelectByName(LXi_VMAP_TEXTUREUV, "Texture"));
+		// Get the vmap, if not successful, skip layer
+		LxResult uv_lookup = vmap.SelectByName(LXi_VMAP_TEXTUREUV, "Texture");
+		if (uv_lookup != LXe_OK)
+			continue;
 
-		// Create our simple visitor and enumerate for each polygon
-		CVisitor visitor(&polygon, &point, meshmap.ID());
-		LxResult visitor_result;
-		visitor_result = polygon.Enum(&visitor, LXiMARK_ANY, 0);
+		LXtMeshMapID vmap_id = vmap.ID();
 
-		// Fail if we find any face-verts which haven't been mapped,
-		if (visitor_result != LXe_OK)
-			cmd_error(LXe_FAILED, "unmappedUV");
-
-		// Copies over the harvested UV data to the UV Packer
-		if (visitor.m_FaceArray.size() > 0)
+		// For each polygon, get uv values for uvp
+		unsigned polygon_count;
+		mesh.PolygonCount(&polygon_count);
+		for (unsigned polygon_index = 0; polygon_index < polygon_count; polygon_index++)
 		{
-			uvpInput.m_UvData.m_FaceCount = visitor.m_FaceArray.size();
-			uvpInput.m_UvData.m_pFaceArray = visitor.m_FaceArray.data();
-		}
+			// Change the currently active polygon and get it's ID
+			polygon.SelectByIndex(polygon_index);
+			LXtPolygonID polygon_id = polygon.ID();
 
-		if (visitor.m_VertArray.size() > 0)
-		{
-			uvpInput.m_UvData.m_VertCount = visitor.m_VertArray.size();
-			uvpInput.m_UvData.m_pVertArray = visitor.m_VertArray.data();
-		}
+			// Store the Polygon ID so we can access and set the 
+			std::pair<LXtPolygonID, int> polygon_id_lookup(polygon_id, uvp_face_index);
+			polygon_map.insert(polygon_id_lookup);
 
-		// Initialize a progress bar for the user
-		CLxUser_Monitor monitor;
-		dialog_service.MonitorAllocate("Packing", monitor);
-		monitor.Init(100);
+			// Get the number of vertices for this polygon,
+			unsigned vertex_count;
+			polygon.VertexCount(&vertex_count);
 
-		// Run the execute method in another thread to not block main thread,
-		// see execute method for more details...
-		auto future = std::async(std::bind(&UvpOpExecutorT::execute, &opExecutor, uvpInput));
+			// Check if the polygon is selected
+			CLxResult polygon_selected = polygon.TestMarks(mode);
 
-		// Keep track of progress on this thread,
-		unsigned progress = 0;
+			// Create the UVP Face, the counter uvp_polygon_id will act as the ID that we have mapped to Modo's IDs
+			// https://uvpackmaster.com/sdkdoc/10-classes/50-uvfacet/
+			m_FaceArray.emplace_back(uvp_face_index);
+			UvFaceT& face = m_FaceArray.back();
+			if (polygon_selected.isTrue())
+				face.m_InputFlags = 1; // Sets the selection flag, couldn't find how to properly set it using the enum `uvpcore::UVP_FACE_INPUT_FLAGS::SELECTED`
+			face.m_Verts.reserve((SizeT)vertex_count);
 
-		// Update every poll to see if user aborted the monitor progress, 
-		bool bUserAborted = false;
-
-		// Poll the packer instance every 50ms to check on progress,
-		// while we keep getting progress updates.
-		while (progress < 100)
-		{
-			unsigned step = opExecutor.packing_progress - progress;
-			bUserAborted = monitor.Step(step);
-			progress += step;
-
-			if (bUserAborted)
+			// For each face vertex, get the texcoord values
+			for (unsigned vertex_index = 0; vertex_index < vertex_count; vertex_index++)
 			{
-				opExecutor.cancel();
-				break;
-			}
+				LXtPointID point_id;
+				polygon.VertexByIndex(vertex_index, &point_id);
 
-			std::this_thread::sleep_for(std::chrono::milliseconds(50));
-		}
+				unsigned point_index;
+				point.Index(&point_index);
 
-		// Take the monitor the final step,
-		monitor.Step(opExecutor.packing_progress - progress);
+				// Get the UV coordinates for polygon vertex
+				polygon.MapEvaluate(vmap_id, point_id, texcoords);
 
-		// Get the result code from the packer instance, hopefully joins
-		// the async thread also.
-		UVP_ERRORCODE Result = UVP_ERRORCODE::GENERAL_ERROR;
-		try
-		{
-			if (future.valid())
-			{
-				Result = future.get();
-			}
-		} // Should only raise an exception if we're running in debug
-		catch (const std::exception& ex) {
-			// Set up to create log entries,
-			CLxUser_Log log;
-			CLxUser_LogService log_service;
-			CLxUser_LogEntry entry;
+				// And the positional data
+				point.Select(point_id);
+				point.Pos(position);
 
-			// Get the Master Log,
-			log_service.GetSubSystem(LXsLOG_LOGSYS, log);
+				// Create vertex and copy values for uvp, comments below are from docs
+				// https://uvpackmaster.com/sdkdoc/10-classes/40-uvvertt/
+				UvVertT uvp_vertex;
 
-			// Print the runtime error to log so we can read any validation errors.
-			log_service.NewEntry(LXe_INFO, ex.what(), entry);
+				// UV coordinates of the given UV vertex. This field must always be 
+				// initialized by the application.
+				uvp_vertex.m_UvCoords[0] = texcoords[0];
+				uvp_vertex.m_UvCoords[1] = texcoords[1];
 
-			log.AddEntry(entry);
-		}
+				// An integer value which is internally ignored by the packer, so the 
+				// application may initialize it according to its needs. In particular 
+				// this field might be used when building m_pVertArray in order to 
+				// distinguish two UV vertices which have the same UV coordinates, but 
+				// correspond to two different 3D vertices. Check the Sample application
+				// code for a usage example - it initializes the m_ControlId field with 
+				// an index of the corresponding 3d vertex in order to avoid duplicated 
+				// vertices in a UV face.
+				uvp_vertex.m_ControlId = reinterpret_cast<int>(point_id);
 
-		// Release progress bar.
-		dialog_service.MonitorRelease();
+				// 3d coordinates of the 3d vertex corresponding to the given UV vertex. 
+				// Currently this field is only used when m_NormalizeIslands parameter
+				// is set to true. Otherwise it is ignored by the packer, hence it doesn’t
+				// have to be initialized by the application.
+				uvp_vertex.m_Vert3dCoords[0] = position[0];
+				uvp_vertex.m_Vert3dCoords[1] = position[1];
+				uvp_vertex.m_Vert3dCoords[2] = position[2];
 
-		// Switch on the result and return error messages defined as a 
-		// message table in our config, see index.cfg
-		switch (Result) {
-		case UVP_ERRORCODE::SUCCESS:
-			// All went fine, we likely don't have to report back anything
-			break;
-		case UVP_ERRORCODE::CANCELLED:
-			cmd_error(LXe_ABORT, "uvpAborted");
-			break;
-		case UVP_ERRORCODE::INVALID_ISLANDS:
-			cmd_error(LXe_FAILED, "uvpInvalidIslands");
-			break;
-		case UVP_ERRORCODE::NO_SPACE:
-			// We have likely restricted the packer from scaling the 
-			// islands, and it failed to fit them inside 0->1 uv range.
-			cmd_error(LXe_FAILED, "uvpNoSpace");
-			break;
-		case UVP_ERRORCODE::NO_VALID_STATIC_ISLAND:
-			cmd_error(LXe_FAILED, "uvpNoValidStaticIsland");
-			break;
-		default:
-			// Default to our "generic" error
-			cmd_error(LXe_FAILED, "uvpFailed");
-		}
-
-		// fail if we did not recieve any solution,
-		if (!opExecutor.getLastMessage(UvpMessageT::MESSAGE_CODE::ISLANDS) || !opExecutor.getLastMessage(UvpMessageT::MESSAGE_CODE::PACK_SOLUTION))
-		{
-			cmd_error(LXe_FAILED, "uvpMsgNotFound");
-		}
-
-		const UvpIslandsMessageT* pIslandsMsg = static_cast<const UvpIslandsMessageT*>(opExecutor.getLastMessage(UvpMessageT::MESSAGE_CODE::ISLANDS));
-		const UvpPackSolutionMessageT* pPackSolutionMsg = static_cast<const UvpPackSolutionMessageT*>(opExecutor.getLastMessage(UvpMessageT::MESSAGE_CODE::PACK_SOLUTION));
-
-		// Following the FBX example this is the apply function,
-		std::vector<LXtFVector2> transformedUVs(visitor.m_VertArray.size());
-
-		// Initially copy the original UV coordinates.
-		for (int i = 0; i < visitor.m_VertArray.size(); i++)
-		{
-			const auto& origVert = visitor.m_VertArray[i];
-			transformedUVs[i][0] = origVert.m_UvCoords[0];
-			transformedUVs[i][1] = origVert.m_UvCoords[1];
-		}
-
-		// Transform UV coordinates accordingly
-		const auto& islands = pIslandsMsg->m_Islands;
-		for (const UvpIslandPackSolutionT& islandSolution : pPackSolutionMsg->m_IslandSolutions)
-		{
-			const IdxArrayT& island = islands[islandSolution.m_IslandIdx];
-			CLxMatrix4 solutionMatrix;
-			islandSolutionToMatrix(islandSolution, solutionMatrix);
-
-			for (int faceId : island)
-			{
-				const UvFaceT& face = visitor.m_FaceArray[faceId];
-
-				for (int vertIdx : face.m_Verts)
+				// Check for duplicate entries, as we iterate over each polygon they are likely to have vertices which
+				// have same uv and positional values.
+				auto iterator = uv_map.find(uvp_vertex);
+				size_t uvp_vert_index;
+				if (iterator == uv_map.end()) 
 				{
-					const UvVertT& origVert = visitor.m_VertArray[vertIdx];
-					LXtVector4 inputUv = { origVert.m_UvCoords[0], origVert.m_UvCoords[1], 0.0, 1.0 };
-					LXtVector4 transformedUv;
-
-					mat4x4_mul_vec4(transformedUv, solutionMatrix, inputUv);
-
-					transformedUVs[vertIdx][0] = transformedUv[0] / transformedUv[3];
-					transformedUVs[vertIdx][1] = transformedUv[1] / transformedUv[3];
+					uvp_vert_index = m_VertArray.size(); // Get the size to update which index we're on.
+					uv_map[uvp_vertex] = uvp_vert_index; // Add the pair uvp_vertex, uvp_vert_index to the uv_map
+					m_VertArray.emplace_back(uvp_vertex);// Add the current UvVertT to the back of the array
+					point_map[uvp_vert_index] = point_id;// Store so we can get the point id for a uv vertex.
 				}
-			}
-		}
-		// This is where we then want to start setting the UV values ...
-		for (const UvFaceT& uvFace : visitor.m_FaceArray)
-		{
-			polygon.SelectByIndex(uvFace.m_FaceId);
-			for (const int vertIdx : uvFace.m_Verts)
-			{
-				const UvVertT& UvVert = visitor.m_VertArray[vertIdx];
-				point.SelectByIndex(UvVert.m_ControlId);
-				polygon.SetMapValue(point.ID(), meshmap.ID(), transformedUVs[vertIdx]);
-			}
-		}
+				else 
+				{	// For the found pair, get the second element, which is the previously stored index.
+					uvp_vert_index = (*iterator).second;
+				}
 
-		scan.SetMeshChange(index, LXf_MESHEDIT_MAP_UV);
+				face.m_Verts.pushBack(uvp_vert_index);
+			}
+			uvp_face_index++;
+		}
+	}
+	selected_layers.Apply(); // If we don't apply, next layerscan will fail it seem,
+	selected_layers.clear();
+	selected_layers = NULL;
+
+	// Transfer the collected data to uvp input
+	if (m_FaceArray.size() > 0)
+	{
+		uvpInput.m_UvData.m_FaceCount = m_FaceArray.size();
+		uvpInput.m_UvData.m_pFaceArray = m_FaceArray.data();
+	}
+	if (m_VertArray.size() > 0)
+	{
+		uvpInput.m_UvData.m_VertCount = m_VertArray.size();
+		uvpInput.m_UvData.m_pVertArray = m_VertArray.data();
 	}
 
-	scan.Apply();
+	// Initialize a progress bar for the user
+	CLxUser_Monitor monitor;
+	dialog_service.MonitorAllocate("Packing", monitor);
+	monitor.Init(100);
+
+	// Run the execute method in another thread to not block main thread,
+	// see execute method for more details...
+	auto future = std::async(std::bind(&UvpOpExecutorT::execute, &opExecutor, uvpInput));
+
+	// Keep track of progress on this thread,
+	unsigned progress = 0;
+
+	// Update every poll to see if user aborted the monitor progress, 
+	bool bUserAborted = false;
+
+	// Poll the packer instance every 50ms to check on progress,
+	// while we keep getting progress updates.
+	while (progress < 100)
+	{
+		unsigned step = opExecutor.packing_progress - progress;
+		bUserAborted = monitor.Step(step);
+		progress += step;
+
+		if (bUserAborted)
+		{
+			opExecutor.cancel();
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+
+	// Take the monitor the final step,
+	monitor.Step(opExecutor.packing_progress - progress);
+
+	// Get the result code from the packer instance, hopefully joins
+	// the async thread also.
+	UVP_ERRORCODE Result = UVP_ERRORCODE::GENERAL_ERROR;
+	try
+	{
+		if (future.valid())
+		{
+			Result = future.get();
+		}
+	} // Should only raise an exception if we're running in debug
+	catch (const std::exception & ex) {
+		// Set up to create log entries,
+		CLxUser_Log log;
+		CLxUser_LogService log_service;
+		CLxUser_LogEntry entry;
+
+		// Get the Master Log,
+		log_service.GetSubSystem(LXsLOG_LOGSYS, log);
+
+		// Print the runtime error to log so we can read any validation errors.
+		log_service.NewEntry(LXe_INFO, ex.what(), entry);
+
+		log.AddEntry(entry);
+	}
+
+	// Release progress bar.
+	dialog_service.MonitorRelease();
+
+	// Switch on the result and return error messages defined as a 
+	// message table in our config, see index.cfg
+	switch (Result) {
+	case UVP_ERRORCODE::SUCCESS:
+		// All went fine, we likely don't have to report back anything
+		break;
+	case UVP_ERRORCODE::CANCELLED:
+		cmd_error(LXe_ABORT, "uvpAborted");
+		break;
+	case UVP_ERRORCODE::INVALID_ISLANDS:
+		// If there are two UV faces in a single island with different values 
+		// of the parameter specified, then such an island will be reported as
+		// invalid and the operation will fail with an INVLAID_ISLANDS return
+		// code.
+		cmd_error(LXe_FAILED, "uvpInvalidIslands");
+		break;
+	case UVP_ERRORCODE::NO_SPACE:
+		// We have likely restricted the packer from scaling the 
+		// islands, and it failed to fit them inside 0->1 uv range.
+		cmd_error(LXe_FAILED, "uvpNoSpace");
+		break;
+	case UVP_ERRORCODE::NO_VALID_STATIC_ISLAND:
+		cmd_error(LXe_FAILED, "uvpNoValidStaticIsland");
+		break;
+	default:
+		// Default to our "generic" error
+		cmd_error(LXe_FAILED, "uvpFailed");
+	}
+
+	// fail if we did not recieve any solution,
+	if (!opExecutor.getLastMessage(UvpMessageT::MESSAGE_CODE::ISLANDS) || !opExecutor.getLastMessage(UvpMessageT::MESSAGE_CODE::PACK_SOLUTION))
+	{
+		cmd_error(LXe_FAILED, "uvpMsgNotFound");
+	}
+
+	const UvpIslandsMessageT* pIslandsMsg = static_cast<const UvpIslandsMessageT*>(opExecutor.getLastMessage(UvpMessageT::MESSAGE_CODE::ISLANDS));
+	const UvpPackSolutionMessageT* pPackSolutionMsg = static_cast<const UvpPackSolutionMessageT*>(opExecutor.getLastMessage(UvpMessageT::MESSAGE_CODE::PACK_SOLUTION));
+
+	// Copy over the values from the original input to the new texcoords
+	std::vector<LXtFVector2> solved_texcoords(m_VertArray.size());
+	for (int i = 0; i < m_VertArray.size(); i++)
+	{
+		const UvVertT& origVert = m_VertArray[i];
+		solved_texcoords[i][0] = origVert.m_UvCoords[0];
+		solved_texcoords[i][1] = origVert.m_UvCoords[1];
+	}
+	
+	// Apply the transforms for the packing solution,
+	const auto& islands = pIslandsMsg->m_Islands;
+	const auto& solutions = pPackSolutionMsg->m_IslandSolutions;
+	for (const UvpIslandPackSolutionT& islandSolution : pPackSolutionMsg->m_IslandSolutions)
+	{
+		const IdxArrayT& island = islands[islandSolution.m_IslandIdx];
+
+		// Given a solution from uvp, get 
+		CLxMatrix4 solutionMatrix;
+		islandSolutionToMatrix(islandSolution, solutionMatrix);
+
+		for (int faceId : island)
+		{
+			const UvFaceT& face = m_FaceArray[faceId];
+
+			for (int vertIdx : face.m_Verts)
+			{
+				const UvVertT& origVert = m_VertArray[vertIdx];
+				LXtVector4 input_uv = { origVert.m_UvCoords[0], origVert.m_UvCoords[1], 0.0, 1.0 };
+				LXtVector4 solved_uv;
+
+				mat4x4_mul_vec4(solved_uv, solutionMatrix, input_uv);
+
+				solved_texcoords[vertIdx][0] = solved_uv[0] / solved_uv[3];
+				solved_texcoords[vertIdx][1] = solved_uv[1] / solved_uv[3];
+			}
+		}
+	}
+
+	CLxUser_LayerScan editable_layers;
+	check(layer_service.ScanAllocate(LXf_LAYERSCAN_EDIT, editable_layers));
+	unsigned editable_layer_count;
+	editable_layers.Count(&editable_layer_count);
+	for (unsigned layer_index = 0; layer_index < editable_layer_count; layer_index++)
+	{
+		check(editable_layers.EditMeshByIndex(layer_index, mesh));
+		check(polygon.fromMesh(mesh));
+		check(vmap.fromMesh(mesh));
+
+		// Get the vmap, if not successful, skip layer
+		CLxResult uv_lookup = vmap.SelectByName(LXi_VMAP_TEXTUREUV, "Texture");
+		if (uv_lookup.fail())
+			continue;
+
+		// For each polygon, set the uv for selected polygons,
+		unsigned polygon_count;
+		mesh.PolygonCount(&polygon_count);
+		for (unsigned polygon_index = 0; polygon_index < polygon_count; polygon_index++)
+		{
+			polygon.SelectByIndex(polygon_index);
+			LXtPolygonID polygon_id = polygon.ID();
+
+			// Just skip this polygon if not selected,
+			CLxResult polygon_selected = polygon.TestMarks(mode);
+			if (polygon_selected.isFalse())
+				continue;
+
+			// Find the index for the current polygon in the polygon map,
+			// the second element should hold index to solved uv face.
+			int face_index = -1;
+			auto iterator = polygon_map.find(polygon_id);
+			if (iterator != polygon_map.end())
+				face_index = iterator->second;
+
+			// For each vertex in face, set the solved uv coordinates. Duplicate checks should already been made so 
+			const UvFaceT& uv_face = m_FaceArray[face_index];
+			for (const int vert_index : uv_face.m_Verts)
+			{
+				const UvVertT& uv_vert = m_VertArray[vert_index];
+				// Find the stored point id for the uv vertex and set the map value
+				auto point_id_lookup = point_map.find(vert_index);
+				if (point_id_lookup != point_map.end())
+					check(polygon.SetMapValue((*point_id_lookup).second, vmap.ID(), solved_texcoords[vert_index]));
+			}
+		}
+		// If a mesh is accessed for write, any edits made have to be signalled back to the mesh.
+		mesh.SetMeshEdits(LXf_MESHEDIT_MAP_UV);
+		// The mesh change bit mask should be set for all edited meshes before changes are applied.
+		editable_layers.SetMeshChange(layer_index, LXf_MESHEDIT_MAP_UV);
+		// performs the mesh edits, but does not terminate the scan.
+		editable_layers.Update();
+	}
+	editable_layers.Apply();
 }
 
 // Basically attempting to do the same as CLxCommand::cmd_error
