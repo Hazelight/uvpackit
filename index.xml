@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<package version="1500">
+<package version="1300">
   <kit name="uvpackit" restart="YES">
     <source target="uvpackit/index.cfg">index.cfg</source>
     <source target="uvpackit/icons/uvp_20.png">icons/uvp_20.png</source>

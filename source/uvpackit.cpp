@@ -29,6 +29,8 @@
 #include <lx_layer.hpp>
 #include <lx_mesh.hpp>
 
+#include <algorithm>
+
 using namespace uvpcore;
 using namespace lx_err; // gives us check()
 
@@ -49,7 +51,7 @@ private:
 
 	bool m_DebugMode;
 
-	UvpOperationT* operation;
+	UvpOperationT* operation = nullptr;
 
 	void destroyMessages()
 	{
@@ -260,6 +262,93 @@ void islandSolutionToMatrix(const UvpIslandPackSolutionT& islandSolution, CLxMat
 
 #define SRVNAME_COMMAND	"uvp.pack" // Define for our command name,
 
+class CMapPopup : public CLxDynamicUIValue
+{
+public:
+	std::vector<std::string> names;
+	int BuildNameList();
+
+	unsigned Flags() LXx_OVERRIDE
+	{
+		return LXfVALHINT_POPUPS;
+	}
+
+	unsigned PopCount() LXx_OVERRIDE
+	{
+		return names.size();
+	}
+
+	const char* PopUserName(unsigned index) LXx_OVERRIDE
+	{
+		if (index >= names.size())
+			return "OOB";
+		return names[index].c_str();
+	}
+
+	const char* PopInternalName(unsigned index) LXx_OVERRIDE
+	{
+		if (index >= names.size())
+			return "OOB";
+		return names[index].c_str();
+	}
+};
+
+class UVMapVisitor : public CLxImpl_AbstractVisitor
+{
+	CLxUser_MeshMap* vmap;
+	std::set<std::string> names;
+
+	virtual LxResult Evaluate()
+	{
+		const char* mapName;
+		if (LXx_OK(vmap->Name(&mapName))) {
+			names.insert(std::string(mapName));
+		}
+		return LXe_OK;
+	}
+
+public:
+	UVMapVisitor(CLxUser_MeshMap* vmap) { this->vmap = vmap; }
+	std::set<std::string> GetNames() { return names; }
+	void ClearNames() { names.clear(); }
+};
+
+int CMapPopup::BuildNameList()
+{
+	CLxUser_LayerService layer_service;
+	CLxUser_LayerScan layer_scan;
+	CLxUser_Mesh mesh;
+	CLxUser_MeshMap vmap;
+	std::set<std::string> name_set;
+
+	check(layer_service.ScanAllocate(LXf_LAYERSCAN_ACTIVE | LXf_LAYERSCAN_MARKPOLYS, layer_scan));
+	unsigned layer_count;
+	layer_scan.Count(&layer_count);
+	for (unsigned layer_index = 0; layer_index < layer_count; layer_index++)
+	{
+		layer_scan.MeshBase(layer_index, mesh);
+		mesh.GetMaps(vmap);
+		UVMapVisitor visitor(&vmap);
+		vmap.FilterByType(LXi_VMAP_TEXTUREUV);
+		vmap.Enum(&visitor);
+
+		std::set<std::string> names = visitor.GetNames();
+		name_set.insert(names.begin(), names.end());
+	}
+	layer_scan.Apply();
+	layer_scan.clear();
+	layer_scan = NULL;
+
+	std::set<std::string>::iterator map_iterator;
+	for (map_iterator = name_set.begin(); map_iterator != name_set.end(); map_iterator++) {
+		names.push_back(*map_iterator);
+	}
+
+	std::sort(names.begin() + 1, names.end());
+
+	return 0;
+};
+
 class CCommand : public CLxBasicCommand
 {
 public:
@@ -274,6 +363,7 @@ public:
 	void cmd_error(LxResult rc, const char* message);
 
 	bool selectedPolygons();
+	CLxDynamicUIValue* atrui_UIValue(unsigned int index) LXx_OVERRIDE;
 };
 
 // Initialize the command, creating the arguments
@@ -292,6 +382,18 @@ CCommand::CCommand()
 
 	dyna_Add("renderInvalid", LXsTYPE_BOOLEAN);
 	dyna_SetFlags(7, LXfCMDARG_OPTIONAL);
+
+	dyna_Add("texture", LXsTYPE_STRING);
+}
+
+CLxDynamicUIValue* CCommand::atrui_UIValue(unsigned int index)
+{
+	if (index == 8) {
+		CMapPopup* ui_value = new CMapPopup;
+		ui_value->BuildNameList();
+		return ui_value;
+	}
+	return 0;
 }
 
 // Set default values for the command dialog
@@ -305,6 +407,8 @@ LxResult CCommand::cmd_DialogInit()
 	attr_SetFlt(3, 0.0); // pixelMargin
 	attr_SetFlt(4, 0.0); // pixelPadding
 	attr_SetInt(5, 2048); // pixelMarginTextureSize
+
+	attr_SetString(8, "Texture"); // set the default UV Map
 
 	return LXe_OK;
 }
@@ -431,6 +535,9 @@ void CCommand::basic_Execute(unsigned flags)
 	if(dyna_IsSet(7))
 		uvpInput.m_RenderInvalidIslands = dyna_Bool(7, false);
 
+	std::string map_name;
+	dyna_String(8, map_name, "Texture");
+
 	// Set debug to false for release,
 	#ifdef _DEBUG
 	bool debugMode = true;
@@ -489,7 +596,7 @@ void CCommand::basic_Execute(unsigned flags)
 		check(vmap.fromMesh(mesh));
 
 		// Get the vmap, if not successful, skip layer
-		LxResult uv_lookup = vmap.SelectByName(LXi_VMAP_TEXTUREUV, "Texture");
+		LxResult uv_lookup = vmap.SelectByName(LXi_VMAP_TEXTUREUV, map_name.c_str());
 		if (uv_lookup != LXe_OK)
 			continue;
 
@@ -533,8 +640,10 @@ void CCommand::basic_Execute(unsigned flags)
 				point.Index(&point_index);
 
 				// Get the UV coordinates for polygon vertex
-				polygon.MapEvaluate(vmap_id, point_id, texcoords);
-
+				CLxResult uv_result = polygon.MapEvaluate(vmap_id, point_id, texcoords);
+				if (uv_result != LXe_OK)
+					cmd_error(LXe_FAILED, "unmappedUV");
+									
 				// And the positional data
 				point.Select(point_id);
 				point.Pos(position);
@@ -752,7 +861,7 @@ void CCommand::basic_Execute(unsigned flags)
 		check(vmap.fromMesh(mesh));
 
 		// Get the vmap, if not successful, skip layer
-		CLxResult uv_lookup = vmap.SelectByName(LXi_VMAP_TEXTUREUV, "Texture");
+		CLxResult uv_lookup = vmap.SelectByName(LXi_VMAP_TEXTUREUV, map_name.c_str());
 		if (uv_lookup.fail())
 			continue;
 
