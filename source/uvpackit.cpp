@@ -262,37 +262,6 @@ void islandSolutionToMatrix(const UvpIslandPackSolutionT& islandSolution, CLxMat
 
 #define SRVNAME_COMMAND	"uvp.pack" // Define for our command name,
 
-class CMapPopup : public CLxDynamicUIValue
-{
-public:
-	std::vector<std::string> names;
-	int BuildNameList();
-
-	unsigned Flags() LXx_OVERRIDE
-	{
-		return LXfVALHINT_POPUPS;
-	}
-
-	unsigned PopCount() LXx_OVERRIDE
-	{
-		return names.size();
-	}
-
-	const char* PopUserName(unsigned index) LXx_OVERRIDE
-	{
-		if (index >= names.size())
-			return "OOB";
-		return names[index].c_str();
-	}
-
-	const char* PopInternalName(unsigned index) LXx_OVERRIDE
-	{
-		if (index >= names.size())
-			return "OOB";
-		return names[index].c_str();
-	}
-};
-
 class UVMapVisitor : public CLxImpl_AbstractVisitor
 {
 	CLxUser_MeshMap* vmap;
@@ -313,42 +282,6 @@ public:
 	void ClearNames() { names.clear(); }
 };
 
-int CMapPopup::BuildNameList()
-{
-	CLxUser_LayerService layer_service;
-	CLxUser_LayerScan layer_scan;
-	CLxUser_Mesh mesh;
-	CLxUser_MeshMap vmap;
-	std::set<std::string> name_set;
-
-	check(layer_service.ScanAllocate(LXf_LAYERSCAN_ACTIVE | LXf_LAYERSCAN_MARKPOLYS, layer_scan));
-	unsigned layer_count;
-	layer_scan.Count(&layer_count);
-	for (unsigned layer_index = 0; layer_index < layer_count; layer_index++)
-	{
-		layer_scan.MeshBase(layer_index, mesh);
-		mesh.GetMaps(vmap);
-		UVMapVisitor visitor(&vmap);
-		vmap.FilterByType(LXi_VMAP_TEXTUREUV);
-		vmap.Enum(&visitor);
-
-		std::set<std::string> names = visitor.GetNames();
-		name_set.insert(names.begin(), names.end());
-	}
-	layer_scan.Apply();
-	layer_scan.clear();
-	layer_scan = NULL;
-
-	std::set<std::string>::iterator map_iterator;
-	for (map_iterator = name_set.begin(); map_iterator != name_set.end(); map_iterator++) {
-		names.push_back(*map_iterator);
-	}
-
-	std::sort(names.begin() + 1, names.end());
-
-	return 0;
-};
-
 class CCommand : public CLxBasicCommand
 {
 public:
@@ -359,11 +292,11 @@ public:
 	int basic_CmdFlags() LXx_OVERRIDE;
 	bool basic_Enable(CLxUser_Message& msg) LXx_OVERRIDE;
 	void basic_Execute(unsigned flags);
+	LxResult cmd_Query(unsigned int index, ILxUnknownID value_array) LXx_OVERRIDE;
 
 	void cmd_error(LxResult rc, const char* message);
-
+	LxResult atrui_UIHints(unsigned index, ILxUnknownID hints) LXx_OVERRIDE;
 	bool selectedPolygons();
-	CLxDynamicUIValue* atrui_UIValue(unsigned int index) LXx_OVERRIDE;
 };
 
 // Initialize the command, creating the arguments
@@ -383,32 +316,80 @@ CCommand::CCommand()
 	dyna_Add("renderInvalid", LXsTYPE_BOOLEAN);
 	dyna_SetFlags(7, LXfCMDARG_OPTIONAL);
 
-	dyna_Add("texture", LXsTYPE_STRING);
-}
-
-CLxDynamicUIValue* CCommand::atrui_UIValue(unsigned int index)
-{
-	if (index == 8) {
-		CMapPopup* ui_value = new CMapPopup;
-		ui_value->BuildNameList();
-		return ui_value;
-	}
-	return 0;
+	dyna_Add("texture", LXsTYPE_VERTMAPNAME);
+	dyna_SetFlags(8, LXfCMDARG_QUERY);
 }
 
 // Set default values for the command dialog
 LxResult CCommand::cmd_DialogInit()
 {
-	attr_SetBool(0, true); // stretch
-	attr_SetBool(1, true); // orient
+	if (!dyna_IsSet(0))
+		attr_SetBool(0, true); // stretch
+	if (!dyna_IsSet(1))
+		attr_SetBool(1, true); // orient
 
-	attr_SetFlt(2, 0.003); // margin
+	if (!dyna_IsSet(2))
+		attr_SetFlt(2, 0.003); // margin
 
-	attr_SetFlt(3, 0.0); // pixelMargin
-	attr_SetFlt(4, 0.0); // pixelPadding
-	attr_SetInt(5, 2048); // pixelMarginTextureSize
+	if (!dyna_IsSet(3))
+		attr_SetFlt(3, 0.0); // pixelMargin
+	if (!dyna_IsSet(4))
+		attr_SetFlt(4, 0.0); // pixelPadding
+	if (!dyna_IsSet(5))
+		attr_SetInt(5, 2048); // pixelMarginTextureSize
 
-	attr_SetString(8, "Texture"); // set the default UV Map
+	return LXe_OK;
+}
+
+// There is some help from the default command class in exposing dropdown options for users when it comes to picking vmaps,
+// using atrui_UIHints we can tell Modo we want a dropdown with all vmaps of certain type and use cmd_Query to set the initial default value,
+LxResult CCommand::atrui_UIHints(unsigned index, ILxUnknownID hints)
+{
+	CLxUser_UIHints uiHints(hints);
+	if (index == 8)
+	{
+		uiHints.VertmapAllowNone(false); // Specifies when a value of (none) is allowed in the list. Default is TRUE.
+		uiHints.VertmapItemMode(true); // Specifies that the list is only generated from the selected item. Default is FALSE.
+	}
+
+	return LXe_OK;
+}
+
+LxResult CCommand::cmd_Query(unsigned int index, ILxUnknownID value_array)
+{
+	CLxUser_ValueArray va(value_array);
+	if (index == 8) {
+		CLxUser_LayerService layer_service;
+		CLxUser_LayerScan layer_scan;
+		CLxUser_Mesh mesh;
+		CLxUser_MeshMap vmap;
+		std::set<std::string> name_set;
+
+		check(layer_service.ScanAllocate(LXf_LAYERSCAN_ACTIVE, layer_scan));
+		unsigned layer_count;
+		layer_scan.Count(&layer_count);
+		for (unsigned layer_index = 0; layer_index < layer_count; layer_index++)
+		{
+			layer_scan.MeshBase(layer_index, mesh);
+			mesh.GetMaps(vmap);
+			UVMapVisitor visitor(&vmap);
+			vmap.FilterByType(LXi_VMAP_TEXTUREUV);
+			vmap.Enum(&visitor);
+
+			std::set<std::string> names = visitor.GetNames();
+			name_set.insert(names.begin(), names.end());
+		}
+		layer_scan.Apply();
+		layer_scan.clear();
+		layer_scan = NULL;
+
+		if (name_set.empty())
+			return LXe_FAILED;
+		else {
+			auto name = name_set.begin();
+			va.AddString(name->c_str());
+		}
+	}
 
 	return LXe_OK;
 }
@@ -423,19 +404,50 @@ bool CCommand::selectedPolygons()
 {
 	bool result = false;
 
-	// Initiate the selection service and an array with polygon type and a null,
+	// Initiate the selection service and an zero terminated array with selection types to check current selection against,
 	CLxUser_SelectionService selection_service;
-	LXtID4 selection_types[2];
+	LXtID4 selection_types[5];
 	
-	selection_types[0] = selection_service.LookupType(LXsSELTYP_POLYGON);
-	selection_types[1] = 0;
+	selection_types[0] = selection_service.LookupType(LXsSELTYP_VERTEX);
+	selection_types[1] = selection_service.LookupType(LXsSELTYP_EDGE);
+	selection_types[2] = selection_service.LookupType(LXsSELTYP_POLYGON);
+	selection_types[3] = selection_service.LookupType(LXsSELTYP_ITEM);
+	selection_types[4] = 0;
 
-	// Check the service for currently active selection type,
+	// Check the service for currently active selection type in array,
 	LXtID4 current_type = selection_service.CurrentType(selection_types);
 
 	// If we are in polygon mode and have polygons selected, result should be set to true
 	if (current_type == LXiSEL_POLYGON)
-		result = selection_service.Count(LXiSEL_POLYGON);
+	{
+		// Initiate the layer service and a mesh,
+		CLxUser_LayerService layer_service;
+		CLxUser_LayerScan selected_layers;
+		unsigned selected_layers_count;
+		CLxUser_Mesh mesh;
+		
+		// total polycount for all active layers,
+		unsigned total_polycount = 0;
+		
+		// iterate over each selected mesh and sum up total polygon count,
+		check(layer_service.ScanAllocate(LXf_LAYERSCAN_ACTIVE, selected_layers));
+		check(selected_layers.Count(&selected_layers_count));		
+		for (unsigned i = 0; i < selected_layers_count; i++)
+		{
+			check(selected_layers.MeshBase(i, mesh));
+
+			unsigned polycount;
+			check(mesh.PolygonCount(&polycount));
+
+			total_polycount += polycount;
+		}
+
+		// count how many polygons users currently have selected,
+		int num_selected_polygons = selection_service.Count(LXiSEL_POLYGON);
+
+		// true if users have a subset of polygons selected, selecting all or nothing should return false,
+		result = 0 < num_selected_polygons && num_selected_polygons < total_polycount;
+	}
 
 	return result;
 }
@@ -535,8 +547,13 @@ void CCommand::basic_Execute(unsigned flags)
 	if(dyna_IsSet(7))
 		uvpInput.m_RenderInvalidIslands = dyna_Bool(7, false);
 
+	// Get the Vertex Map to work with,
 	std::string map_name;
-	dyna_String(8, map_name, "Texture");
+	if (dyna_IsSet(8))
+		dyna_String(8, map_name);
+	
+	if (map_name.empty())
+		cmd_error(LXe_FAILED, "missingArgumentVMap");
 
 	// Set debug to false for release,
 	#ifdef _DEBUG

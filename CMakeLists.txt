@@ -7,8 +7,8 @@ project(uvpackit)
 set(LXSDK_PATH "" CACHE PATH "Path to root of downloaded LXSDK")
 
 # Paths to version 2.5.7 of installed UVPackmaster
-set(UVP_INCLUDE "C:/Program Files/UVPackmaster/SDK/std/2.5.7/include" CACHE PATH "Path to UVP includes")
-set(UVP_LIBRARY "C:/Program Files/UVPackmaster/SDK/std/2.5.7/lib/vs2019/Release" CACHE PATH "Path to UVP libraries")
+set(UVP_INCLUDE "C:/Program Files/UVPackmaster/SDK/std/2.5.8/include" CACHE PATH "Path to UVP includes")
+set(UVP_LIBRARY "C:/Program Files/UVPackmaster/SDK/std/2.5.8/lib/vs2019/Release" CACHE PATH "Path to UVP libraries")
 
 # Get all source and headers for lxsdk
 # TODO: Read somewhere it's recommended not to use GLOB like this,
