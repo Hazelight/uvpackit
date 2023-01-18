@@ -399,59 +399,6 @@ int CCommand::basic_CmdFlags()
 	return LXfCMD_MODEL | LXfCMD_UNDO;
 }
 
-// Utility method for checking if we have any currently selected polygons
-bool CCommand::selectedPolygons()
-{
-	bool result = false;
-
-	// Initiate the selection service and an zero terminated array with selection types to check current selection against,
-	CLxUser_SelectionService selection_service;
-	LXtID4 selection_types[5];
-	
-	selection_types[0] = selection_service.LookupType(LXsSELTYP_VERTEX);
-	selection_types[1] = selection_service.LookupType(LXsSELTYP_EDGE);
-	selection_types[2] = selection_service.LookupType(LXsSELTYP_POLYGON);
-	selection_types[3] = selection_service.LookupType(LXsSELTYP_ITEM);
-	selection_types[4] = 0;
-
-	// Check the service for currently active selection type in array,
-	LXtID4 current_type = selection_service.CurrentType(selection_types);
-
-	// If we are in polygon mode and have polygons selected, result should be set to true
-	if (current_type == LXiSEL_POLYGON)
-	{
-		// Initiate the layer service and a mesh,
-		CLxUser_LayerService layer_service;
-		CLxUser_LayerScan selected_layers;
-		unsigned selected_layers_count;
-		CLxUser_Mesh mesh;
-		
-		// total polycount for all active layers,
-		unsigned total_polycount = 0;
-		
-		// iterate over each selected mesh and sum up total polygon count,
-		check(layer_service.ScanAllocate(LXf_LAYERSCAN_ACTIVE, selected_layers));
-		check(selected_layers.Count(&selected_layers_count));		
-		for (unsigned i = 0; i < selected_layers_count; i++)
-		{
-			check(selected_layers.MeshBase(i, mesh));
-
-			unsigned polycount;
-			check(mesh.PolygonCount(&polycount));
-
-			total_polycount += polycount;
-		}
-
-		// count how many polygons users currently have selected,
-		int num_selected_polygons = selection_service.Count(LXiSEL_POLYGON);
-
-		// true if users have a subset of polygons selected, selecting all or nothing should return false,
-		result = 0 < num_selected_polygons && num_selected_polygons < total_polycount;
-	}
-
-	return result;
-}
-
 // Make sure the command is disabled with no active layers
 bool CCommand::basic_Enable(CLxUser_Message& msg)
 {
@@ -532,17 +479,6 @@ void CCommand::basic_Execute(unsigned flags)
 	// for every island.
 	uvpInput.m_NormalizeIslands = dyna_Bool(6, false);
 
-	// If users are in Polygon mode, and have polygons selected, assume they want to pack
-	// the selected polygons into pre-existing packing solution.
-	bool bArePolygonsSelected = selectedPolygons();
-	uvpInput.m_PackToOthers = bArePolygonsSelected;
-
-	// If m_ProcessedUnselected is set to false (the default state), then the 
-	// SELECTED flag of the UV faces is ignored by the packer and every island
-	// is considered as selected (the application doesn’t have to set this flag
-	// in such a case).
-	uvpInput.m_ProcessUnselected = bArePolygonsSelected; // Required so we check unselected
-
 	// Optionally, render invalid UVs to better show users how to satisfy the packer.
 	if(dyna_IsSet(7))
 		uvpInput.m_RenderInvalidIslands = dyna_Bool(7, false);
@@ -597,6 +533,12 @@ void CCommand::basic_Execute(unsigned flags)
 	unsigned mode;
 	check(mesh_service.ModeCompose("select", NULL, &mode));
 
+	// Create flag to test if polygon is hidden,
+	unsigned hidden;
+	check(mesh_service.ModeCompose(LXsMARK_HIDE, NULL, &hidden));
+
+	bool pack_to_others = false;
+
 	// Iterate over all selected meshes,
 	CLxUser_LayerScan selected_layers;
 	unsigned selected_layers_count;
@@ -628,6 +570,11 @@ void CCommand::basic_Execute(unsigned flags)
 			polygon.SelectByIndex(polygon_index);
 			LXtPolygonID polygon_id = polygon.ID();
 
+			// Skip hidden polygons,
+			CLxResult polygon_hidden = polygon.TestMarks(hidden);
+			if (polygon_hidden.isTrue())
+				continue;
+
 			// Store the Polygon ID so we can access and set the 
 			std::pair<LXtPolygonID, int> polygon_id_lookup(polygon_id, uvp_face_index);
 			polygon_map.insert(polygon_id_lookup);
@@ -643,8 +590,12 @@ void CCommand::basic_Execute(unsigned flags)
 			// https://uvpackmaster.com/sdkdoc/10-classes/50-uvfacet/
 			m_FaceArray.emplace_back(uvp_face_index);
 			UvFaceT& face = m_FaceArray.back();
-			if (polygon_selected.isTrue())
-				face.m_InputFlags = 1; // Sets the selection flag, couldn't find how to properly set it using the enum `uvpcore::UVP_FACE_INPUT_FLAGS::SELECTED`
+			if (polygon_selected.isTrue()) {
+				face.m_InputFlags = static_cast<int>(uvpcore::UVP_FACE_INPUT_FLAGS::SELECTED);
+			} else {
+				pack_to_others = true;
+				face.m_InputFlags = 0;
+			}
 			face.m_Verts.reserve((SizeT)vertex_count);
 
 			// For each face vertex, get the texcoord values
@@ -716,6 +667,16 @@ void CCommand::basic_Execute(unsigned flags)
 	selected_layers.Apply(); // If we don't apply, next layerscan will fail it seem,
 	selected_layers.clear();
 	selected_layers = NULL;
+
+	// If users are in Polygon mode, and have polygons selected, assume they want to pack
+	// the selected polygons into pre-existing packing solution.
+	uvpInput.m_PackToOthers = pack_to_others;
+
+	// If m_ProcessedUnselected is set to false (the default state), then the 
+	// SELECTED flag of the UV faces is ignored by the packer and every island
+	// is considered as selected (the application doesn’t have to set this flag
+	// in such a case).
+	uvpInput.m_ProcessUnselected = pack_to_others; // Required so we check unselected
 
 	// Transfer the collected data to uvp input
 	if (m_FaceArray.size() > 0)
@@ -813,6 +774,7 @@ void CCommand::basic_Execute(unsigned flags)
 		cmd_error(LXe_FAILED, "uvpNoSpace");
 		break;
 	case UVP_ERRORCODE::NO_VALID_STATIC_ISLAND:
+		// m_PackToOthers is set to true, but packer either recieved only selected parts or unselected parts outside of the packing area.
 		cmd_error(LXe_FAILED, "uvpNoValidStaticIsland");
 		break;
 	default:
